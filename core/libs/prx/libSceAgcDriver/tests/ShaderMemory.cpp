@@ -911,17 +911,23 @@ void verifyPixelRequestSerialization() {
     const auto withoutPixel = serializer.Deserialize(serializer.Serialize(request));
     require(!withoutPixel.request.context.pixel.has_value() && withoutPixel.request.context.vertex.has_value() && withoutPixel.request.context.vertex->fetchAttribReg == 17u && withoutPixel.request.context.memory.size() == 1u && withoutPixel.request.context.memory[0].guestAddress == 0x60000u && withoutPixel.request.target.nonConstantImageOffsets && withoutPixel.request.layout.firstBinding == 11u && !withoutPixel.request.useCache, "a request without pixel state was misaligned");
 
+    const std::array<ResolvedScalarCall, 2> resolvedCalls{{{0x74u, 0x200u}, {0x90u, 0x240u}}};
+    request.context.resolvedCalls = resolvedCalls;
+    const auto withCalls = serializer.Deserialize(serializer.Serialize(request));
+    require(std::ranges::equal(withCalls.request.context.resolvedCalls, resolvedCalls), "resolved scalar calls did not round-trip");
+    request.context.resolvedCalls = {};
+
     RecompileRequest minimal{};
     minimal.shader = {ShaderStage::Fragment, 0x30000u, code, 0, {}};
     minimal.context.waveSize = 64;
     minimal.context.pixel = ShaderPixelStageInfo{};
     const auto encoded = serializer.Serialize(minimal);
-    require(requestPrefix(encoded, 8u) == "NVNQQQ0AAAA=", "new requests did not use serialization version 13");
+    require(requestPrefix(encoded, 8u) == "NVNQQQ4AAAA=", "new requests did not use serialization version 14");
     constexpr std::size_t mappingOffset = 8u + 37u + 18u + 163u;
     for (std::size_t bytes = 0; bytes < 8u; ++bytes) {
         expectFailure([&] { static_cast<void>(serializer.Deserialize(requestPrefix(encoded, mappingOffset + bytes))); }, "truncated data", "a truncated version-12 pixel mapping was accepted");
     }
-    for (const auto unsupported : {"NVNQQQAAAAA=", "NVNQQQ4AAAA="}) {
+    for (const auto unsupported : {"NVNQQQAAAAA=", "NVNQQQ8AAAA="}) {
         expectFailure([&] { static_cast<void>(serializer.Deserialize(unsupported)); }, "serialization version", "an unsupported request version was accepted");
     }
 }

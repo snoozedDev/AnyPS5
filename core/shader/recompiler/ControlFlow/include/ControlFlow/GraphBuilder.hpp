@@ -3,7 +3,9 @@
 
 #include "ControlFlow/ControlFlowGraph.hpp"
 #include "RdnaDecoder/RdnaProgram.hpp"
+#include "Recompiler.hpp"
 #include <cstdint>
+#include <span>
 #include <vector>
 
 namespace ShaderRecompiler {
@@ -12,12 +14,16 @@ struct SwappcInfo {
     bool fetchCallAllowed = false;
     std::uint32_t userDataBaseRegister = 0;
     std::uint32_t userDataCount = 0;
+    std::span<const ResolvedScalarCall> resolvedCalls;
 };
+
+[[nodiscard]] std::vector<UserDataCall> FindUserDataCalls(const RdnaProgram& program, const SwappcInfo& swappc);
 
 struct SwappcCall {
     std::uint32_t callIndex = 0;
     std::uint32_t linkRegister = 0;
     bool fetch = false;
+    bool resolved = false;
     std::uint32_t targetIndex = 0;
     std::uint32_t targetProgramCounter = 0;
     std::uint32_t returnIndex = 0;

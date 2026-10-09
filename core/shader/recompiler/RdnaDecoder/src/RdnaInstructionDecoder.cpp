@@ -40,9 +40,9 @@ std::string toHexString(std::uint32_t value) {
 
 }
 
-RdnaProgram RdnaInstructionDecoder::Decode(std::span<const std::uint32_t> code) const {
+RdnaProgram RdnaInstructionDecoder::Decode(std::span<const std::uint32_t> code, std::span<const std::uint32_t> knownTargetProgramCounters) const {
     RdnaProgram program;
-    DecodeRdnaProgram(code, program);
+    DecodeRdnaProgram(code, program, knownTargetProgramCounters);
     return program;
 }
 
@@ -147,12 +147,19 @@ RdnaProgram DecodeRdnaFrontProgram(std::span<const std::uint32_t> front) {
     throw std::out_of_range("front program decode reached the code boundary before s_setpc_b64");
 }
 
-void DecodeRdnaProgram(std::span<const std::uint32_t> code, RdnaProgram& program) {
+void DecodeRdnaProgram(std::span<const std::uint32_t> code, RdnaProgram& program, std::span<const std::uint32_t> knownTargetProgramCounters) {
     program.instructions.clear();
     program.instructions.reserve(code.size());
     program.code = code;
 
     std::uint32_t furthestBranchTarget = 0;
+    for (const auto programCounter : knownTargetProgramCounters) {
+        const std::uint32_t targetIndex = programCounter / static_cast<std::uint32_t>(sizeof(std::uint32_t));
+        if ((programCounter & 3u) != 0u || targetIndex >= code.size()) {
+            throw std::out_of_range("known call target is out of the code span bounds");
+        }
+        furthestBranchTarget = std::max(furthestBranchTarget, targetIndex);
+    }
     for (std::uint32_t wordIndex = 0; wordIndex < code.size();) {
         const std::uint32_t programCounter = wordIndex * static_cast<std::uint32_t>(sizeof(std::uint32_t));
         program.instructions.push_back(DecodeRdnaInstruction(programCounter, code, wordIndex));
@@ -172,8 +179,39 @@ void DecodeRdnaProgram(std::span<const std::uint32_t> code, RdnaProgram& program
             return;
         }
     }
+    if (!knownTargetProgramCounters.empty() && !program.instructions.empty() && program.instructions.back().op == RdnaOpcode::SSetpcB64) {
+        return;
+    }
 
     throw std::out_of_range("RDNA program decode reached the code boundary before s_endpgm");
+}
+
+RdnaProgram DecodeRdnaSubroutine(std::span<const std::uint32_t> code, std::uint32_t linkRegister) {
+    RdnaProgram program;
+    program.code = code;
+    std::uint32_t furthestBranchTarget = 0;
+    for (std::uint32_t wordIndex = 0; wordIndex < code.size();) {
+        const std::uint32_t programCounter = wordIndex * static_cast<std::uint32_t>(sizeof(std::uint32_t));
+        program.instructions.push_back(DecodeRdnaInstruction(programCounter, code, wordIndex));
+        const RdnaInstruction& instruction = program.instructions.back();
+        wordIndex += instruction.wordCount;
+        if (IsDirectBranchOpcode(instruction.op)) {
+            const std::uint32_t targetIndex = instruction.branchTarget / static_cast<std::uint32_t>(sizeof(std::uint32_t));
+            if (targetIndex >= code.size()) {
+                throw std::out_of_range("branch target is out of the code span bounds");
+            }
+            furthestBranchTarget = std::max(furthestBranchTarget, targetIndex);
+        }
+        const bool returns = instruction.op == RdnaOpcode::SSetpcB64 && instruction.source0.kind == RdnaOperandKind::ScalarRegister && instruction.source0.reg == linkRegister;
+        if (returns && furthestBranchTarget < wordIndex) {
+            program.code = code.first(wordIndex);
+            return program;
+        }
+        if (instruction.op == RdnaOpcode::SGetpcB64 || instruction.op == RdnaOpcode::SCallB64 || instruction.op == RdnaOpcode::SSwappcB64 || instruction.op == RdnaOpcode::SEndpgm || (instruction.op == RdnaOpcode::SSetpcB64 && !returns)) {
+            throw std::invalid_argument("scalar subroutine at program counter " + toHexString(programCounter) + " uses program-counter-relative control flow, which an appended copy cannot preserve");
+        }
+    }
+    throw std::out_of_range("scalar subroutine decode reached the code boundary before its s_setpc_b64 return");
 }
 
 RdnaOperand DecodeRdnaScalarSource(std::uint32_t code, std::uint32_t programCounter) {

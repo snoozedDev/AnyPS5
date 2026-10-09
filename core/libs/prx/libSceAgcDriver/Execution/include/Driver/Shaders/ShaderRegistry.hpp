@@ -20,9 +20,22 @@ struct ShaderSnapshot;
 using ShaderRegistry = std::map<std::uint64_t, std::shared_ptr<const ShaderSnapshot>>;
 
 struct PreparedShaderState {
+    struct ResolvedCallee {
+        std::uint64_t address;
+        std::vector<std::uint32_t> code;
+    };
+    struct ResolvedCallees {
+        std::vector<ShaderRecompiler::ResolvedScalarCall> calls;
+        std::vector<ResolvedCallee> callees;
+    };
     struct Entry {
         std::size_t codeOffset;
         std::shared_ptr<const ShaderRecompiler::SourceHandle> handle;
+        std::shared_ptr<const ResolvedCallees> callees;
+    };
+    struct UserDataCalls {
+        std::size_t codeOffset;
+        std::vector<ShaderRecompiler::UserDataCall> calls;
     };
     struct Rectangle {
         std::uint64_t vertexId;
@@ -40,6 +53,7 @@ struct PreparedShaderState {
         std::vector<std::weak_ptr<const ShaderSnapshot>> stages;
     };
     std::vector<Entry> entries;
+    std::vector<UserDataCalls> userDataCalls;
     std::vector<std::vector<std::uint64_t>> registeredAbis;
     std::vector<GraphicsAbi> graphicsAbis;
     std::vector<Rectangle> rectangles;

@@ -102,13 +102,16 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request) {
     const auto inputInfo = RequestInputInfo(request);
 
     constexpr RdnaInstructionDecoder decoder;
-    const auto decoded = decoder.Decode(request.shader.code);
+    std::vector<std::uint32_t> knownTargets;
+    for (const auto& call : request.context.resolvedCalls) knownTargets.push_back(call.targetProgramCounter);
+    const auto decoded = decoder.Decode(request.shader.code, knownTargets);
 
     constexpr GraphBuilder graphBuilder;
     SwappcInfo swappcInfo;
     swappcInfo.fetchCallAllowed = inputInfo.vertex != nullptr;
     swappcInfo.userDataBaseRegister = request.context.userDataBaseRegister;
     swappcInfo.userDataCount = static_cast<std::uint32_t>(request.context.userData.size());
+    swappcInfo.resolvedCalls = request.context.resolvedCalls;
     auto cfg = graphBuilder.Build(decoded, &swappcInfo);
 
     constexpr Structurizer structurizer;

@@ -618,6 +618,10 @@ target_include_directories(agc_driver_prepared_shaders_tests PRIVATE
         $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>
 )
 
+target_include_directories(agc_driver_scalar_user_data_call_tests PRIVATE
+        $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>
+)
+
 if(BUILD_TESTING)
     add_test(NAME agc_shader_bindless COMMAND agc_shader_memory_tests --bindless)
     set_tests_properties(agc_shader_bindless PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")

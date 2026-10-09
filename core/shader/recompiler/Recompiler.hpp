@@ -168,6 +168,21 @@ inline constexpr std::uint32_t InterpolationQuiet = 1u;
 inline constexpr std::uint32_t InterpolationFlush32 = 2u;
 inline constexpr std::uint32_t InterpolationFlush16 = 4u;
 
+struct ResolvedScalarCall {
+    std::uint32_t callProgramCounter;
+    std::uint32_t targetProgramCounter;
+
+    bool operator==(const ResolvedScalarCall&) const = default;
+};
+
+struct UserDataCall {
+    std::uint32_t programCounter = 0;
+    std::uint32_t userDataRegister = 0;
+    std::uint32_t linkRegister = 0;
+
+    bool operator==(const UserDataCall&) const = default;
+};
+
 struct GuestContext {
     std::uint32_t waveSize;
     std::uint32_t userDataBaseRegister;
@@ -177,6 +192,7 @@ struct GuestContext {
     std::optional<ShaderVertexStageInfo> vertex;
     std::span<const MemoryRegion> memory;
     std::optional<ShaderFloatMode> floatMode;
+    std::span<const ResolvedScalarCall> resolvedCalls;
 };
 
 struct MeshTargetLimits {

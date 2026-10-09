@@ -10,7 +10,7 @@ namespace ShaderRecompiler {
 
 class RdnaInstructionDecoder {
 public:
-    [[nodiscard]] RdnaProgram Decode(std::span<const std::uint32_t> code) const;
+    [[nodiscard]] RdnaProgram Decode(std::span<const std::uint32_t> code, std::span<const std::uint32_t> knownTargetProgramCounters = {}) const;
 
 private:
     [[nodiscard]] RdnaInstruction decodeAt(std::span<const std::uint32_t> code, std::uint32_t wordIndex) const;
@@ -19,7 +19,8 @@ private:
 RdnaInstructionFamily GetRdnaInstructionFamily(std::uint32_t word);
 RdnaInstruction DecodeRdnaInstruction(std::uint32_t programCounter, std::span<const std::uint32_t> code, std::uint32_t wordIndex);
 RdnaProgram DecodeRdnaFrontProgram(std::span<const std::uint32_t> front);
-void DecodeRdnaProgram(std::span<const std::uint32_t> code, RdnaProgram& program);
+void DecodeRdnaProgram(std::span<const std::uint32_t> code, RdnaProgram& program, std::span<const std::uint32_t> knownTargetProgramCounters = {});
+RdnaProgram DecodeRdnaSubroutine(std::span<const std::uint32_t> code, std::uint32_t linkRegister);
 RdnaOperand DecodeRdnaScalarSource(std::uint32_t code, std::uint32_t programCounter);
 RdnaOperand DecodeRdnaScalarDestination(std::uint32_t code, std::uint32_t programCounter);
 RdnaOperand DecodeRdnaVectorGpr(std::uint32_t reg);

@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparationScope.hpp"
 #include "CompiledVariant.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <list>
@@ -138,6 +139,7 @@ void ShaderPreparationTransaction::Commit() {
         for (auto& [key, change] : state->changes) {
             auto& destination = *change.destination;
             destination.entries.swap(change.prepared.entries);
+            destination.userDataCalls.swap(change.prepared.userDataCalls);
             destination.registeredAbis.swap(change.prepared.registeredAbis);
             destination.graphicsAbis.swap(change.prepared.graphicsAbis);
             destination.rectangles.swap(change.prepared.rectangles);
@@ -167,14 +169,108 @@ void PublishRegisteredShader(std::shared_ptr<ShaderRegistry>& registry, const st
     transaction.Commit();
 }
 
+namespace {
+
+std::string HexAddress(std::uint64_t address) {
+    char text[20];
+    std::snprintf(text, sizeof(text), "%llx", static_cast<unsigned long long>(address));
+    return text;
+}
+
+std::vector<std::uint32_t> ReadScalarSubroutine(std::uint64_t address, std::uint32_t linkRegister) {
+    if (address == 0 || (address & 3u) != 0) throw std::runtime_error("AGC driver: scalar call target 0x" + HexAddress(address) + " is null or misaligned");
+    GuestMemory::CheckRange(reinterpret_cast<const void*>(address), sizeof(std::uint32_t), sizeof(std::uint32_t));
+    constexpr std::size_t limit = 64 * 1024;
+    const auto ranges = GuestMemory::CommittedRanges(address, limit);
+    std::uint64_t end = address;
+    for (const auto& range : ranges) {
+        if (range.first != end) break;
+        end = range.second;
+    }
+    const auto available = static_cast<std::size_t>(end - address) / sizeof(std::uint32_t);
+    std::vector<std::uint32_t> code;
+    while (code.size() < available) {
+        const auto previous = code.size();
+        code.resize(std::min(available, std::max<std::size_t>(64, previous * 2)));
+        GuestMemory::Read(address + previous * sizeof(std::uint32_t), std::as_writable_bytes(std::span(code).subspan(previous)), alignof(std::uint32_t));
+        try {
+            const auto decoded = ShaderRecompiler::DecodeRdnaSubroutine(code, linkRegister);
+            code.resize(decoded.code.size());
+            return code;
+        } catch (const std::out_of_range&) {
+            if (code.size() == available) break;
+        }
+    }
+    throw std::runtime_error("AGC driver: scalar subroutine at 0x" + HexAddress(address) + " has no s_setpc_b64 return within mapped code or the size limit");
+}
+
+const std::vector<ShaderRecompiler::UserDataCall>* UserDataCallsFor(const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request) {
+    for (const auto& entry : snapshot.prepared->userDataCalls) {
+        if (entry.codeOffset == codeOffset) return &entry.calls;
+    }
+    if (!snapshot.header.empty() || request.shader.stage != ShaderRecompiler::ShaderStage::Compute) return nullptr;
+    const auto decoded = ShaderRecompiler::RdnaInstructionDecoder{}.Decode(request.shader.code);
+    const ShaderRecompiler::SwappcInfo swappc{false, request.context.userDataBaseRegister, static_cast<std::uint32_t>(request.context.userData.size())};
+    snapshot.prepared->userDataCalls.push_back({codeOffset, ShaderRecompiler::FindUserDataCalls(decoded, swappc)});
+    return &snapshot.prepared->userDataCalls.back().calls;
+}
+
+const PreparedShaders::Entry& ResolvedCallEntryFor(const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request, std::span<const ShaderRecompiler::UserDataCall> calls) {
+    const auto& userData = request.context.userData;
+    std::vector<std::uint64_t> addresses;
+    for (const auto& call : calls) {
+        const auto index = call.userDataRegister - request.context.userDataBaseRegister;
+        if (call.userDataRegister < request.context.userDataBaseRegister || index + 1u >= userData.size()) throw std::runtime_error("AGC driver: s_swappc_b64 call target user data s[" + std::to_string(call.userDataRegister) + ":" + std::to_string(call.userDataRegister + 1u) + "] is outside the dispatch's user data");
+        addresses.push_back(userData[index] | (static_cast<std::uint64_t>(userData[index + 1u]) << 32u));
+    }
+    struct PreparedKeyStorage {};
+    auto& key = HostThreadLocal<std::vector<std::uint64_t>, PreparedKeyStorage>();
+    for (const auto& entry : snapshot.prepared->entries) {
+        if (entry.codeOffset != codeOffset || entry.callees == nullptr || entry.callees->callees.size() != addresses.size()) continue;
+        bool same = true;
+        for (std::size_t index = 0; index < addresses.size() && same; ++index) {
+            const auto& callee = entry.callees->callees[index];
+            const auto bytes = std::as_bytes(std::span(callee.code));
+            GuestMemory::FlushGpuWrites(callee.address, bytes.size());
+            same = callee.address == addresses[index] && GuestMemory::CompareMapped(callee.address, bytes) == GuestMemory::Compare::Equal;
+        }
+        if (!same) continue;
+        auto entryRequest = request;
+        entryRequest.shader.code = ShaderRecompiler::GetPreparedCode(*entry.handle);
+        entryRequest.context.resolvedCalls = entry.callees->calls;
+        ShaderRecompiler::BuildPreparedShaderKey(entryRequest, key);
+        if (ShaderRecompiler::MatchesPreparedShader(entryRequest, *entry.handle, key)) return entry;
+    }
+    auto resolved = std::make_shared<PreparedShaderState::ResolvedCallees>();
+    std::vector<std::uint32_t> combined(request.shader.code.begin(), request.shader.code.end());
+    for (std::size_t index = 0; index < calls.size(); ++index) {
+        auto code = ReadScalarSubroutine(addresses[index], calls[index].linkRegister);
+        const auto target = static_cast<std::uint32_t>(combined.size() * sizeof(std::uint32_t));
+        combined.insert(combined.end(), code.begin(), code.end());
+        resolved->callees.push_back({addresses[index], std::move(code)});
+        resolved->calls.push_back({calls[index].programCounter, target});
+        APS5_LOG_ERR("Compute shader 0x%llx calls 0x%llx through user data s[%u:%u] at program counter 0x%x; preparing the combined program at dispatch", static_cast<unsigned long long>(request.shader.codeAddress), static_cast<unsigned long long>(addresses[index]), calls[index].userDataRegister, calls[index].userDataRegister + 1u, calls[index].programCounter);
+    }
+    auto prepared = request;
+    prepared.shader.code = combined;
+    prepared.context.resolvedCalls = resolved->calls;
+    PerformanceTimer timing("Shader.PrepareArtifact");
+    auto handle = ShaderRecompiler::PrepareShader(prepared);
+    snapshot.prepared->entries.push_back({codeOffset, std::move(handle), std::move(resolved)});
+    return snapshot.prepared->entries.back();
+}
+
+}
+
 std::shared_ptr<const ShaderRecompiler::SourceHandle> SourceHandleFor(const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request) {
     struct PreparedKeyStorage {};
     auto& key = HostThreadLocal<std::vector<std::uint64_t>, PreparedKeyStorage>();
     ShaderRecompiler::BuildPreparedShaderKey(request, key);
     std::lock_guard lock(snapshot.prepared->mutex);
     for (const auto& entry : snapshot.prepared->entries) {
-        if (entry.codeOffset == codeOffset && ShaderRecompiler::MatchesPreparedShader(request, *entry.handle, key)) return entry.handle;
+        if (entry.codeOffset == codeOffset && entry.callees == nullptr && ShaderRecompiler::MatchesPreparedShader(request, *entry.handle, key)) return entry.handle;
     }
+    if (const auto* calls = UserDataCallsFor(snapshot, codeOffset, request); calls != nullptr && !calls->empty()) return ResolvedCallEntryFor(snapshot, codeOffset, request, *calls).handle;
     if (snapshot.header.empty()) {
         if (snapshot.type != 0 || request.shader.stage != ShaderRecompiler::ShaderStage::Compute) throw std::runtime_error("AGC driver: unregistered program is not a compute shader");
         APS5_LOG_ERR("Compute shader 0x%llx was not registered; preparing its artifact at dispatch", static_cast<unsigned long long>(snapshot.codeAddress));
@@ -212,9 +308,18 @@ ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& s
     ShaderRecompiler::BuildPreparedShaderKey(request, key);
     std::lock_guard lock(snapshot.prepared->mutex);
     for (const auto& entry : snapshot.prepared->entries) {
-        if (entry.codeOffset != codeOffset) continue;
+        if (entry.codeOffset != codeOffset || entry.callees != nullptr) continue;
         invocationRequest.shader.code = ShaderRecompiler::GetPreparedCode(*entry.handle);
         if (auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(invocationRequest, entry.handle, key)) return std::move(*invocation);
+    }
+    if (const auto* calls = UserDataCallsFor(snapshot, codeOffset, request); calls != nullptr && !calls->empty()) {
+        const auto& entry = ResolvedCallEntryFor(snapshot, codeOffset, request, *calls);
+        invocationRequest.shader.code = ShaderRecompiler::GetPreparedCode(*entry.handle);
+        invocationRequest.context.resolvedCalls = entry.callees->calls;
+        ShaderRecompiler::BuildPreparedShaderKey(invocationRequest, key);
+        auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(invocationRequest, entry.handle, key);
+        if (!invocation.has_value()) throw std::runtime_error("AGC driver: resolved scalar call artifact does not match its invocation");
+        return std::move(*invocation);
     }
     if (snapshot.header.empty()) {
         if (snapshot.type != 0 || request.shader.stage != ShaderRecompiler::ShaderStage::Compute) throw std::runtime_error("AGC driver: unregistered program is not a compute shader");
@@ -307,7 +412,13 @@ void BuildRegisteredAbiKey(const QueueState& state, const VulkanDevice& device, 
     }
 }
 
-std::vector<PreparedShaders::Entry> PrepareRegistered(const ShaderSnapshot& snapshot, const VulkanDevice& device, const QueueState& state, bool registration) {
+struct PreparedRegistration {
+    std::vector<PreparedShaders::Entry> entries;
+    std::vector<ShaderRecompiler::UserDataCall> userDataCalls;
+    std::size_t codeOffset = 0;
+};
+
+PreparedRegistration PrepareRegistered(const ShaderSnapshot& snapshot, const VulkanDevice& device, const QueueState& state, bool registration) {
     using Stage = ShaderRecompiler::ShaderStage;
     const auto header = ReadHeader(snapshot);
     std::uint32_t programRegister;
@@ -366,12 +477,18 @@ std::vector<PreparedShaders::Entry> PrepareRegistered(const ShaderSnapshot& snap
     std::vector<std::uint32_t> userData(userCount);
     if (stage != Stage::Compute && stage != Stage::Fragment && snapshot.type != 6) vertex = Graphics::DecodeVertexStageInfo(snapshot.header, snapshot.headerAddress, userData, nullptr, true);
     const ShaderRecompiler::SwappcInfo swappc{vertex.has_value(), firstUser, userCount};
+    PreparedRegistration result;
+    result.codeOffset = codeOffset;
+    if (stage == Stage::Compute) {
+        result.userDataCalls = ShaderRecompiler::FindUserDataCalls(decoded, swappc);
+        if (!result.userDataCalls.empty()) return result;
+    }
     auto graph = ShaderRecompiler::GraphBuilder{}.Build(decoded, &swappc);
     ShaderRecompiler::Structurizer{}.Structurize(graph);
     const std::array<ShaderRecompiler::MemoryRegion, 2> memory{{{snapshot.codeAddress, std::as_bytes(std::span(snapshot.code))}, {snapshot.headerAddress, snapshot.header}}};
     ShaderRecompiler::RecompileRequest request{{stage, address, code, snapshot.headerAddress, snapshot.header}, {wave, firstUser, userData, compute, pixel, vertex, memory, RegisteredFloatMode(snapshot)}, stage == Stage::Compute ? device.ComputeTarget(wave) : device.Target(), {0, 0, 0, 128}, graphics};
     if (graphics && graphics->mesh) request.layout.pushConstantSizeBytes = ShaderRecompiler::MeshDrawPushOffsetBytes;
-    std::vector<PreparedShaders::Entry> entries;
+    auto& entries = result.entries;
     const auto append = [&] {
         PerformanceTimer timing("Shader.PrepareArtifact");
         entries.push_back({codeOffset, ShaderRecompiler::PrepareShader(request)});
@@ -384,7 +501,17 @@ std::vector<PreparedShaders::Entry> PrepareRegistered(const ShaderSnapshot& snap
         request.layout.pushConstantSizeBytes = 0;
         append();
     }
-    return entries;
+    return result;
+}
+
+void RecordUserDataCalls(PreparedShaderState& prepared, PreparedRegistration& registration) {
+    if (registration.userDataCalls.empty()) return;
+    for (auto& entry : prepared.userDataCalls) {
+        if (entry.codeOffset != registration.codeOffset) continue;
+        entry.calls = std::move(registration.userDataCalls);
+        return;
+    }
+    prepared.userDataCalls.push_back({registration.codeOffset, std::move(registration.userDataCalls)});
 }
 
 }
@@ -546,12 +673,13 @@ void Driver::ResolveShaderAbi(const Shader* shader, std::span<const ShaderRegist
         transaction.Commit();
         return;
     }
-    auto entries = PrepareRegistered(*snapshot, *localDevice, state, false);
+    auto registration = PrepareRegistered(*snapshot, *localDevice, state, false);
     auto& prepared = transaction.Edit(*snapshot);
-    for (auto& entry : entries) {
+    for (auto& entry : registration.entries) {
         const auto duplicate = std::ranges::any_of(prepared.entries, [&](const auto& existing) { return existing.handle->artifact == entry.handle->artifact; });
         if (!duplicate) prepared.entries.push_back(std::move(entry));
     }
+    RecordUserDataCalls(prepared, registration);
     prepared.registeredAbis.push_back(key);
     transaction.Commit();
 }
@@ -705,8 +833,11 @@ void Driver::RegisterShader(const Shader* shader) {
     registered.shader = snapshot.registeredState->shader;
     registered.context = snapshot.registeredState->context;
     registered.userConfig = snapshot.registeredState->userConfig;
-    snapshot.prepared->entries = PrepareRegistered(snapshot, *localDevice, registered, true);
-    if ((snapshot.type == 0 || snapshot.type == 1) && !snapshot.prepared->entries.empty()) {
+    auto registration = PrepareRegistered(snapshot, *localDevice, registered, true);
+    snapshot.prepared->entries = std::move(registration.entries);
+    const bool registeredAbi = !snapshot.prepared->entries.empty() || !registration.userDataCalls.empty();
+    RecordUserDataCalls(*snapshot.prepared, registration);
+    if ((snapshot.type == 0 || snapshot.type == 1) && registeredAbi) {
         std::vector<std::uint64_t> key;
         BuildRegisteredAbiKey(registered, *localDevice, key);
         snapshot.prepared->registeredAbis.push_back(std::move(key));
@@ -745,7 +876,7 @@ void Driver::RegisterShader(const Shader* shader) {
         nullState.shader = null.registeredState->shader;
         nullState.context = null.registeredState->context;
         nullState.userConfig = null.registeredState->userConfig;
-        null.prepared->entries = PrepareRegistered(null, *localDevice, nullState, true);
+        null.prepared->entries = PrepareRegistered(null, *localDevice, nullState, true).entries;
         PublishRegisteredShader(shaders, std::make_shared<const ShaderSnapshot>(std::move(null)));
     }
     transaction.Commit();

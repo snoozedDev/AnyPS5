@@ -714,7 +714,7 @@ std::string RequestSerializer::Serialize(const RecompileRequest& request) const 
     std::string buffer;
     Writer writer(buffer);
     writer.WriteU32(0x41505335u);
-    writer.WriteU32(13u);
+    writer.WriteU32(14u);
     writeShaderBinary(writer, request.shader);
     writeGuestContext(writer, request.context);
     writeSpirvTarget(writer, request.target);
@@ -733,6 +733,11 @@ std::string RequestSerializer::Serialize(const RecompileRequest& request) const 
     writer.WriteU32(request.target.srgbDecodeFormats);
     if (request.context.compute.has_value()) writer.WriteU32(request.context.compute->scratchDwords);
     writer.WriteBool(request.target.narrowSubgroupClock);
+    writer.WriteU64(request.context.resolvedCalls.size());
+    for (const auto& call : request.context.resolvedCalls) {
+        writer.WriteU32(call.callProgramCounter);
+        writer.WriteU32(call.targetProgramCounter);
+    }
     return base64Encode(buffer);
 }
 
@@ -741,7 +746,7 @@ DeserializedRequest RequestSerializer::Deserialize(std::string_view text) const 
     Reader reader(decoded);
     if (reader.ReadU32() != 0x41505335u) throw std::runtime_error("invalid recompile request signature");
     const auto version = reader.ReadU32();
-    if (version < 1u || version > 13u) throw std::runtime_error("unsupported recompile request serialization version");
+    if (version < 1u || version > 14u) throw std::runtime_error("unsupported recompile request serialization version");
     DeserializedRequest result{};
     result.request.shader = readShaderBinary(reader, result.shaderCode, result.shaderHeader);
     result.request.context = readGuestContext(reader, result, version);
@@ -761,6 +766,18 @@ DeserializedRequest RequestSerializer::Deserialize(std::string_view text) const 
     if (version >= 9u) result.request.target.srgbDecodeFormats = reader.ReadU32();
     if (version >= 10u && result.request.context.compute.has_value()) result.request.context.compute->scratchDwords = reader.ReadU32();
     if (version >= 12u) result.request.target.narrowSubgroupClock = reader.ReadBool();
+    if (version >= 14u) {
+        const auto callCount = reader.ReadU64();
+        reader.Require(callCount, 8u);
+        result.resolvedCalls.reserve(callCount);
+        for (std::uint64_t i = 0; i < callCount; i++) {
+            ResolvedScalarCall call{};
+            call.callProgramCounter = reader.ReadU32();
+            call.targetProgramCounter = reader.ReadU32();
+            result.resolvedCalls.push_back(call);
+        }
+        result.request.context.resolvedCalls = result.resolvedCalls;
+    }
     return result;
 }
 

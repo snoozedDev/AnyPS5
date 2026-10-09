@@ -52,6 +52,7 @@ public:
         append(key, request.context.pixel);
         append(key, request.context.vertex);
         append(key, request.context.floatMode);
+        append(key, request.context.resolvedCalls);
         appendMesh(key, request);
         appendTessellation(key, request);
         std::uint64_t hash = 0xcbf29ce484222325ull;
@@ -84,6 +85,7 @@ private:
         append(key, request.context.pixel);
         append(key, request.context.vertex);
         append(key, request.context.floatMode);
+        append(key, request.context.resolvedCalls);
         appendMesh(key, request);
         appendTessellation(key, request);
         append(key, request.target);
@@ -133,6 +135,14 @@ private:
     static void append(std::vector<std::uint64_t>& key, std::string_view value) {
         append(key, value.size());
         for (const unsigned char byte : value) append(key, byte);
+    }
+
+    static void append(std::vector<std::uint64_t>& key, std::span<const ResolvedScalarCall> calls) {
+        append(key, calls.size());
+        for (const auto& call : calls) {
+            append(key, call.callProgramCounter);
+            append(key, call.targetProgramCounter);
+        }
     }
 
     static void append(std::vector<std::uint64_t>& key, const ShaderFloatMode& value) {

@@ -135,7 +135,9 @@ int main(int argc, char** argv) {
         }
 
         RdnaInstructionDecoder decoder;
-        const auto decoded = decoder.Decode(request.shader.code);
+        std::vector<std::uint32_t> knownTargets;
+        for (const auto& call : request.context.resolvedCalls) knownTargets.push_back(call.targetProgramCounter);
+        const auto decoded = decoder.Decode(request.shader.code, knownTargets);
         const std::string disasm = RdnaProgramToString(decoded);
 
         {
@@ -156,7 +158,12 @@ int main(int argc, char** argv) {
         const auto inputInfo = BuildShaderStageInputInfo(stageKind, request.context, request.target.subgroupSize, request.graphics && request.graphics->mesh ? &*request.graphics->mesh : nullptr);
 
         GraphBuilder graphBuilder;
-        auto cfg = graphBuilder.Build(decoded);
+        SwappcInfo swappcInfo;
+        swappcInfo.fetchCallAllowed = request.context.vertex.has_value();
+        swappcInfo.userDataBaseRegister = request.context.userDataBaseRegister;
+        swappcInfo.userDataCount = static_cast<std::uint32_t>(request.context.userData.size());
+        swappcInfo.resolvedCalls = request.context.resolvedCalls;
+        auto cfg = graphBuilder.Build(decoded, &swappcInfo);
 
         Structurizer structurizer;
         structurizer.Structurize(cfg);
